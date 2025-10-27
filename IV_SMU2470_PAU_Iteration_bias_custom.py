@@ -1,182 +1,307 @@
+import argparse
 import os
+import signal
 import sys
 import time
-import pathlib
-import signal
-import numpy as np
-import pylab as plt
-import pyvisa
 from datetime import datetime
+from pathlib import Path
+
+import numpy as np
 import matplotlib.pyplot as plt
-sys.path.append(pathlib.Path(__file__).parent.resolve())
+import pyvisa
 
-start_time = time.time()
-smu = []
-smuI = []
-pau = []
+# GPIB instrument addresses
+SMU_ADDRESS = "GPIB0::18::INSTR"  # 2400=24 // 2470=18
+PAU_ADDRESS = "GPIB0::22::INSTR"  # 6487
+PAU2_ADDRESS = "GPIB0::14::INSTR"  # Second PAU
 
-opathroot = r'C:\LGAD_test\I-V_test'
-sensorname = 'UFSD-K1_W5_R(4_1)_T10_GR3_0_5x5'
 
 def getdate():
     return datetime.now().strftime("%Y%m%d")
 
-date = getdate()
-Nmeas = 'LFtest20250226'
-Npad = '1'
 
-Ntimes = True
-Iteration = int(input("Enter a positive integer for Iteration: " ) )
-#Iteration = 1
-V0 = 0
-V1 = -250
-npts = 251
+def mkdir(path: Path):
+    path.mkdir(parents=True, exist_ok=True)
 
-V2 = -50
-V3 = -150
-npts1 = 51
 
-return_sweep = True
+def init_instruments(smu_addr: str, pau_addr: str, pau2_addr: str | None = None, verbose: bool = True):
+    """Open and configure the SMU and up to two PAU instruments.
 
-def init():
-    global smu, pau
-    ## initialize lcr and smu
+    Returns (smu, pau, pau2, rm) where pau2 may be None.
+    """
     rm = pyvisa.ResourceManager()
-    print (rm.list_resources())
-    smu = rm.open_resource('GPIB0::18::INSTR') # 2400=24 // 2470=18
-    pau = rm.open_resource('GPIB0::22::INSTR') # 6487
+    if verbose:
+        try:
+            print("Found resources:", rm.list_resources())
+        except Exception:
+            # Some backends may raise if no resources are present
+            pass
 
-    smu.read_termination = '\n'
-    smu.write_termination = '\n'
+    smu = rm.open_resource(smu_addr)
+    pau = rm.open_resource(pau_addr)
+    pau2 = None
+    if pau2_addr:
+        pau2 = rm.open_resource(pau2_addr)
 
+    # Configure SMU
+    smu.read_termination = "\n"
+    smu.write_termination = "\n"
     smu.write(":SOUR:FUNC VOLT")
     smu.write("SOUR:VOLT:LEV 0")
     smu.write("SOUR:VOLT:RANG 1000")
-    smu.write(":SOUR:VOLT:ILIMIT 100e-6") #1mA for full sensors and 100mA for other pads
-#   smu.write(":SOUR:VOLT:ILIMIT 100e-6") #1mA for full sensors and 100mA for other pads
-    smu.write(":SENS:CURR:RANG 100e-6")
+    smu.write(":SOUR:VOLT:ILIMIT 300e-6")
+    smu.write(":SENS:CURR:RANG 300e-6")
     smu.write(":SENS:FUNC \"VOLT\"")
     smu.write(":SENS:FUNC \"CURR\"")
 
+    # Configure PAU(s)
     pau.write("*RST")
     pau.write("curr:range auto")
     pau.write("INIT")
-    pau.write("syst:zcor:stat off")
-    pau.write("syst:zch off")
+    try:
+        pau.write("syst:zcor:stat off")
+        pau.write("syst:zch off")
+    except Exception:
+        # Some models may not support these commands
+        pass
 
-    print (smu.query("*IDN?"))
-    print (pau.query("*IDN?"))
+    if pau2 is not None:
+        try:
+            pau2.write("*RST")
+            pau2.write("curr:range auto")
+            pau2.write("INIT")
+            pau2.write("syst:zcor:stat off")
+            pau2.write("syst:zch off")
+        except Exception:
+            pass
 
-init()
+    if verbose:
+        try:
+            print("SMU:", smu.query("*IDN?"))
+            print("PAU:", pau.query("*IDN?"))
+            if pau2 is not None:
+                print("PAU2:", pau2.query("*IDN?"))
+        except Exception:
+            pass
 
-def iv_smu_pau():
+    return smu, pau, pau2, rm
+
+
+def iv_smu_pau(
+    smu,
+    pau,
+    pau2,
+    outdir: Path,
+    sensorname: str,
+    nmeas: str,
+    npad: str,
+    V0: float,
+    V1: float,
+    npts: int,
+    V2: float | None,
+    V3: float | None,
+    npts1: int,
+    iteration: int,
+    return_sweep: bool = True,
+):
+    """Run the IV sweep using SMU and PAU and save results + plot.
+    """
+    running = True
+
+    def _safe_off_and_close():
+        try:
+            if smu:
+                smu.write(":SOUR:VOLT:LEV 0")
+                smu.write("OUTP OFF")
+                smu.close()
+        except Exception:
+            pass
+        try:
+            if pau:
+                pau.close()
+        except Exception:
+            pass
+        try:
+            if pau2:
+                pau2.close()
+        except Exception:
+            pass
 
     def handler(signum, frame):
-        print ("User interrupt. Turning off the output ...")
-        smu.write(':sour:volt:lev 0')
-        smu.write('outp off')
-        smu.close()
-        pau.close()
-        print ("WARNING: Please make sure the output is turned off!")
-
-        exit(1)
+        print("User interrupt. Turning off the output and closing instruments...")
+        _safe_off_and_close()
+        sys.exit(1)
 
     signal.signal(signal.SIGINT, handler)
 
-    # voltages start/end
+    # build voltage array
     Varr = np.linspace(V0, V1, npts)
-
-    if (V2 is not None):
-        if (V2 > V1) and (V3 > V1):
-            VarrL = Varr[Varr > V2]
-            VarrH = Varr[Varr < V3]
-            VarrM = np.linspace(V2, V3, npts1)
-            Varr = np.concatenate([VarrL, VarrM, VarrH])
-
-    print (Varr)
+    if V2 is not None and V3 is not None and (V2 > V1) and (V3 > V1):
+        VarrL = Varr[Varr > V2]
+        VarrH = Varr[Varr < V3]
+        VarrM = np.linspace(V2, V3, npts1)
+        Varr = np.concatenate([VarrL, VarrM, VarrH])
 
     if return_sweep:
-        Varr_return = np.linspace(V1,V0,int(abs(V0-V1)/5 + 1))
-        Varr = np.concatenate([Varr, Varr_return ])
+        Varr_return = np.linspace(V1, V0, int(abs(V0 - V1) / 5 + 1))
+        Varr = np.concatenate([Varr, Varr_return])
 
-    smu.write(':sour:volt:lev 0')
-    smu.write('outp on')
+    print("Voltage sweep ({} pts):".format(len(Varr)))
 
-    time.sleep(0.5) # 이 값을 바꿔서 충분한 시간을 sleep해줘요! Taiwoo Kim
-    print ("\n")
+    smu.write(":SOUR:VOLT:LEV 0")
+    smu.write("OUTP ON")
+    time.sleep(0.5)
 
-    arr = []
+    data = []
     for V in Varr:
-        smu.write(f':sour:volt:lev {V}')
-        #time.sleep(0.1)
-        time.sleep(0.5) ## 이 값을 바꿔서 충분한 시간을 sleep해줘요! Taiwoo Kim
+        smu.write(f":SOUR:VOLT:LEV {V}")
+        time.sleep(0.5)
 
-        if Ntimes and Iteration > 0:
+        if iteration > 0:
             Ismu_values = []
             Ipau_values = []
+            for _ in range(iteration):
+                Ismu_raw = smu.query(":MEAS:CURR?")
+                pau_raw = pau.query("READ?")
+                pau2_raw = None
+                if pau2 is not None:
+                    pau2_raw = pau2.query("READ?")
+                try:
+                    Ismu = float(Ismu_raw.strip())
+                except Exception:
+                    Ismu = np.nan
+                # PAU returns CSV-like: value,range,status
+                try:
+                    Ipau_str = pau_raw.split(',')[0].strip()
+                    Ipau = float(Ipau_str)
+                except Exception:
+                    Ipau = np.nan
+                try:
+                    if pau2_raw is not None:
+                        Ipau2_str = pau2_raw.split(',')[0].strip()
+                        Ipau2 = float(Ipau2_str)
+                    else:
+                        Ipau2 = np.nan
+                except Exception:
+                    Ipau2 = np.nan
 
-            for n in range(Iteration):
-                Ismu = smu.query(":MEAS:CURR?")
-                Ipau, _, _ = pau.query("READ?").split(',')
-
-                Ismu = float(Ismu)
-                Ipau = float(Ipau[:-1])
-
-                Ipau_values.append(Ipau)
                 Ismu_values.append(Ismu)
-                time.sleep(0.1)  # Pauses for 0.1 seconds between iterations        이 값을 바꿔서 충분한 시간을 sleep해줘요! Taiwoo Kim
+                Ipau_values.append(Ipau)
+                # store pau2 values per-iteration in local list; will average later
+                if 'Ipau2_values' not in locals():
+                    Ipau2_values = []
+                Ipau2_values.append(Ipau2)
+                time.sleep(0.1)
 
-            Ismu_avg = np.mean(Ismu_values)
-            Ipau_avg = np.mean(Ipau_values)
-        
+            Ismu_avg = float(np.nanmean(Ismu_values))
+            Ipau_avg = float(np.nanmean(Ipau_values))
+            Ipau2_avg = float(np.nanmean(Ipau2_values)) if 'Ipau2_values' in locals() else float(np.nan)
         else:
-            print("Invalid input.")
+            print("Iteration must be > 0")
+            Ismu_avg = np.nan
+            Ipau_avg = np.nan
+            Ipau2_avg = np.nan
 
-        Vsmu = smu.query(":MEAS:VOLT?")
-        Vsmu = float(Vsmu)
+        Vsmu_raw = smu.query(":MEAS:VOLT?")
+        try:
+            Vsmu = float(Vsmu_raw.strip())
+        except Exception:
+            Vsmu = float(V)
 
-        print (V, Vsmu, Ismu_avg, Ipau_avg)
-        arr.append([V, Vsmu, Ismu_avg, Ipau_avg])
-        #print (V, Vsmu, Ipau_avg, Ismu_avg)
-        #arr.append([V, Vsmu, Ipau_avg, Ismu_avg])
+        print(f"Vset={V:.3f} Vmeas={Vsmu:.3f} I_pad={Ipau_avg:.3e} I_other={Ipau2_avg:.3e} I_back={Ismu_avg:.3e}")
+        # Order: bias voltage, I_pad (6487), I_other (PAU2), I_back (2470)
+        data.append([V, Ipau_avg, Ipau2_avg, Ismu_avg])
 
-    smu.write(':sour:volt:lev 0')
-    smu.write('outp off')
-    smu.close()
-    pau.close()
+    _safe_off_and_close()
 
-    opath = os.path.join(opathroot, Nmeas, f'{date}_{sensorname}')
-    mkdir(opath)
-
-    fname = f'IV_SMU+PAU_{sensorname}_{date}_{V0}_{V1}_pad{Npad}'
-    ofname = os.path.join(opath, f'{fname}')
-    k=0
-    while (os.path.isfile(ofname)):
-        ofname = f'{ofname}_{k}'
+    date = getdate()
+    outpath = outdir / nmeas / f"{date}_{sensorname}"
+    mkdir(outpath)
+    base = outpath / f"IV_SMU+PAU_{sensorname}_{date}_{V0}_{V1}_pad{npad}"
+    ofname = str(base)
+    k = 0
+    while (Path(ofname + ".csv")).exists():
+        ofname = f"{base}_{k}"
         k += 1
 
-    arr = np.array(arr, dtype=float)
-    np.savetxt(ofname+'.txt', arr)
-    ivplot(arr)
-    plt.savefig(ofname+'.png')
+    arr = np.array(data, dtype=float)
+    header = "bias_voltage,I_pad,I_other,I_back"
+    fmt = "%.6e,%.6e,%.6e,%.6e"
+    np.savetxt(ofname + ".csv", arr, delimiter=",", header=header, fmt=fmt, comments="")    # Plot all currents with updated labels
+    plt.figure()
+    Vabs = np.abs(arr[:, 0])  # bias voltage
+    plt.plot(Vabs, np.abs(arr[:, 1]), marker=".", label="I_pad")
+    plt.plot(Vabs, np.abs(arr[:, 2]), marker=".", label="I_other")
+    plt.plot(Vabs, np.abs(arr[:, 3]), marker=".", label="I_back")
+    plt.yscale("log")
+    plt.xlabel("|Bias Voltage| (V)")
+    plt.ylabel("|Current| (A)")
+    plt.legend()
+    plt.grid(True, which="both", ls="--", alpha=0.4)
+    plt.tight_layout()
+    plt.savefig(ofname + ".png")
 
-def ivplot(arr, yrange=None):
-    arr = np.array(arr).T
-    V = arr[0]
-    I = arr[2] # 2인 경우, total current 측정 , 3인 경우 단일 pad current 측정
-    I[I>1e37] = min(I)
-    plt.plot(abs(arr[0]), abs(arr[2]))
-    plt.yscale('log')
-    if yrange:
-        plt.ylim(yrange)	
-if __name__=='__main__':
-    iv_smu_pau()
-    plt.show()
-end_time = time.time()
-print(end_time - start_time)
 
-def mkdir(path):
-    os.makedirs(path, exist_ok=True)
+def parse_args():
+    parser = argparse.ArgumentParser(description="Run IV sweep with SMU and PAU (simplified)")
+    parser.add_argument("--iteration", "-n", type=int, default=1, help="Number of measurements per voltage")
+    parser.add_argument("--V0", type=float, default=0.0, help="Start voltage")
+    parser.add_argument("--V1", type=float, default=-250.0, help="End voltage")
+    parser.add_argument("--npts", type=int, default=251, help="Number of points in main sweep")
+    parser.add_argument("--V2", type=float, default=-50.0, help="Optional mid low for custom sweep")
+    parser.add_argument("--V3", type=float, default=-150.0, help="Optional mid high for custom sweep")
+    parser.add_argument("--npts1", type=int, default=51, help="Points in mid sweep")
+    parser.add_argument("--no-return", dest="return_sweep", action="store_false", help="Disable return sweep")
+    parser.add_argument("--outdir", type=Path, default=Path.home() / "LGAD_test" / "I-V_test", help="Output root directory")
+    parser.add_argument("--sensorname", type=str, default="sensor", help="Sensor name for filenames")
+    parser.add_argument("--nmeas", type=str, default="LGADtest", help="Measurement name folder")
+    parser.add_argument("--npad", type=str, default="1", help="Pad number")
+    return parser.parse_args()
 
-def getdate():
-    return datetime.now().strftime("%Y%m%d")
+
+def main():
+    args = parse_args()
+    start_time = time.time()
+
+    try:
+        smu, pau, pau2, rm = init_instruments(SMU_ADDRESS, PAU_ADDRESS, PAU2_ADDRESS)
+    except Exception as e:
+        print("Failed to open instruments:", e)
+        return
+
+    try:
+        iv_smu_pau(
+            smu=smu,
+            pau=pau,
+            pau2=pau2,
+            outdir=args.outdir,
+            sensorname=args.sensorname,
+            nmeas=args.nmeas,
+            npad=args.npad,
+            V0=args.V0,
+            V1=args.V1,
+            npts=args.npts,
+            V2=args.V2,
+            V3=args.V3,
+            npts1=args.npts1,
+            iteration=args.iteration,
+            return_sweep=args.return_sweep,
+        )
+    finally:
+        # ensure resources closed if not already
+        try:
+            smu.write(":SOUR:VOLT:LEV 0")
+            smu.write("OUTP OFF")
+        except Exception:
+            pass
+        try:
+            smu.close()
+        except Exception:
+            pass
+
+    end_time = time.time()
+    print(f"Elapsed: {end_time - start_time:.2f} s")
+
+
+if __name__ == "__main__":
+    main()
