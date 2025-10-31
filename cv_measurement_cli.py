@@ -5,7 +5,6 @@ import signal
 import time
 from datetime import datetime
 from pathlib import Path
-from typing import Optional
 
 import numpy as np
 import matplotlib.pyplot as plt
@@ -13,7 +12,8 @@ import pyvisa
 
 
 # ------------------------- Configuration -------------------------
-PAU_ADDRESS = "GPIB1::22::INSTR"  # Keithley 6487 (PAU)
+SMU_ADDRESS = "GPIB1::18::INSTR"  # Keithley 2470
+LCR_ADDRESS = "GPIB1::6::INSTR"   # Wayne Kerr 4300
 # -----------------------------------------------------------------
 
 
@@ -29,8 +29,8 @@ class CVMeasurement:
     def __init__(self):
         self.output_dir = Path.home() / "LGAD_test" / "C-V_test"
         self.voltage_start = 0
-        self.voltage_end = -40
-        self.voltage_steps = 81
+        self.voltage_end = -50
+        self.voltage_steps = 101
         self.frequency = 1000  # Hz
         self.iteration_count = 1
         self.sensor_name = "SENSOR"
@@ -41,28 +41,27 @@ class CVMeasurement:
     # Connection & Configuration
     # --------------------------------------------------------------
     def connect_instruments(self):
-        """Connect Keithley 6487 (GPIB) and LCR meter (USB)."""
+        """Connect Keithley 2470 and Wayne Kerr 4300 via GPIB."""
         rm = pyvisa.ResourceManager()
 
-        print("\n🔌 Scanning VISA devices...")
+        print("\n🔌 Scanning VISA GPIB devices...")
         resources = rm.list_resources()
         for i, r in enumerate(resources):
             print(f"{i+1}: {r}")
 
         try:
-            print(f"\nConnecting to Keithley 6487 at {PAU_ADDRESS} ...")
-            self.pau = rm.open_resource(PAU_ADDRESS)
+            print(f"\nConnecting to Keithley 2470 SMU at {SMU_ADDRESS} ...")
+            self.smu = rm.open_resource(SMU_ADDRESS)
+            self.smu.read_termination = "\n"
+            self.smu.write_termination = "\n"
 
-            lcr_idx = int(input("\nSelect LCR meter number from the list above: ")) - 1
-            if lcr_idx < 0 or lcr_idx >= len(resources):
-                raise ValueError("Invalid LCR selection")
-
-            self.lcr = rm.open_resource(resources[lcr_idx])
+            print(f"Connecting to Wayne Kerr 4300 LCR at {LCR_ADDRESS} ...")
+            self.lcr = rm.open_resource(LCR_ADDRESS)
             self.lcr.read_termination = "\n"
             self.lcr.write_termination = "\n"
 
             print("\n✅ Connected instruments:")
-            print(f"PAU: {self.pau.query('*IDN?').strip()}")
+            print(f"SMU: {self.smu.query('*IDN?').strip()}")
             print(f"LCR: {self.lcr.query('*IDN?').strip()}")
             return True
 
@@ -70,26 +69,29 @@ class CVMeasurement:
             print(f"\n❌ Connection error: {e}")
             return False
 
+    # --------------------------------------------------------------
     def configure_instruments(self):
-        """Configure both instruments."""
+        """Configure Keithley 2470 SMU and Wayne Kerr 4300."""
         try:
-            print("\n⚙️ Configuring Keithley 6487...")
-            self.pau.write("*RST")
-            self.pau.write(":SYST:ZCH OFF")
-            self.pau.write(":SOUR:VOLT:RANG 500")
-            self.pau.write(":SOUR:VOLT:ILIM 1e-4")
-            self.pau.write(":SOUR:VOLT:STAT OFF")
-            self.pau.write(":FORM:ELEM CURR,VOLT")
+            print("\n⚙️ Configuring Keithley 2470 SMU...")
+            self.smu.write("*RST")
+            self.smu.write(":SOUR:FUNC VOLT")
+            self.smu.write(":SOUR:VOLT:MODE FIXED")
+            self.smu.write(":SENS:FUNC 'CURR'")
+            self.smu.write(":SOUR:VOLT:RANG 200")
+            self.smu.write(":SENS:CURR:RANG 1e-3")
+            self.smu.write(":SOUR:VOLT:ILIM 1e-4")  # 100 µA limit
+            self.smu.write(":OUTP OFF")
 
-            print("⚙️ Configuring LCR meter...")
+            print("⚙️ Configuring Wayne Kerr 4300 LCR meter...")
             self.lcr.write("*RST")
-            self.lcr.write(":MEAS:FUNC1 C")
-            self.lcr.write(":MEAS:FUNC2 R")
-            self.lcr.write(":MEAS:EQU-CCT PAR")
-            self.lcr.write(":MEAS:SPEED FAST")
-            self.lcr.write(":MEAS:LEV 0.1")
-            self.lcr.write(":MEAS:BIAS OFF")
-            self.lcr.write(f":MEAS:FREQ {self.frequency}")
+            self.lcr.write("FUNC:IMP CPD")              # C and D (parallel)
+            self.lcr.write(f"FREQ {self.frequency}")    # Hz
+            self.lcr.write("VOLT 0.1")                  # 100 mVrms test signal
+            self.lcr.write("BIAS:STAT OFF")             # disable internal DC bias
+            self.lcr.write("TRIG:SOUR BUS")             # trigger via GPIB
+            self.lcr.write("DISP:PAGE MEAS")
+            time.sleep(0.5)
             return True
 
         except Exception as e:
@@ -111,9 +113,9 @@ class CVMeasurement:
 
         def safe_off():
             try:
-                self.pau.write(":SOUR:VOLT 0")
-                self.pau.write(":SOUR:VOLT:STAT OFF")
-                self.lcr.write(":MEAS:BIAS OFF")
+                self.smu.write(":SOUR:VOLT 0")
+                self.smu.write(":OUTP OFF")
+                self.lcr.write("BIAS:STAT OFF")
             except Exception:
                 pass
 
@@ -124,48 +126,50 @@ class CVMeasurement:
 
         signal.signal(signal.SIGINT, sigint_handler)
 
-        self.pau.write(":SOUR:VOLT 0")
-        self.pau.write(":SOUR:VOLT:STAT ON")
+        # Enable voltage source
+        self.smu.write(":SOUR:VOLT 0")
+        self.smu.write(":OUTP ON")
         time.sleep(1)
 
         for V in voltages:
             if V > 0:
-                print("Warning: positive bias not allowed. Forcing 0 V.")
+                print("⚠️ Positive bias not allowed — forcing 0 V.")
                 V = 0
 
-            self.pau.write(f":SOUR:VOLT {V}")
-            time.sleep(0.1)
+            self.smu.write(f":SOUR:VOLT {V}")
+            time.sleep(0.2)
 
             # Measure current and voltage
             try:
-                raw = self.pau.query(":READ?").strip()
+                raw = self.smu.query(":READ?")
                 vals = [float(x) for x in raw.split(",") if self._isfloat(x)]
-                Ipau, Vpau = vals[0], vals[1]
+                if len(vals) >= 2:
+                    I_meas, V_meas = vals[0], vals[1]
+                else:
+                    I_meas, V_meas = np.nan, V
             except Exception:
-                Ipau, Vpau = np.nan, V
+                I_meas, V_meas = np.nan, V
 
-            # Measure capacitance/resistance
-            cap_vals, res_vals = [], []
-            for _ in range(self.iteration_count):
-                try:
-                    res = self.lcr.query(":MEAS:TRIG?").strip()
-                    vals = [float(x) for x in res.split(",") if self._isfloat(x)]
-                    if len(vals) >= 2:
-                        cap_vals.append(vals[0])
-                        res_vals.append(vals[1])
-                except Exception:
-                    continue
+            # Trigger LCR measurement
+            try:
+                self.lcr.write("TRIG")
                 time.sleep(0.05)
-
-            C_avg = np.mean(cap_vals) if cap_vals else np.nan
-            R_avg = np.mean(res_vals) if res_vals else np.nan
+                res = self.lcr.query("FETC?").strip()
+                vals = [float(x) for x in res.split(",") if self._isfloat(x)]
+                if len(vals) >= 2:
+                    C_meas, D_meas = vals[0], vals[1]
+                    R_meas = 1 / (2 * np.pi * self.frequency * C_meas * D_meas) if (C_meas > 0 and D_meas > 0) else np.nan
+                else:
+                    C_meas, R_meas = np.nan, np.nan
+            except Exception:
+                C_meas, R_meas = np.nan, np.nan
 
             data["voltage"].append(V)
-            data["capacitance"].append(C_avg)
-            data["resistance"].append(R_avg)
-            data["current"].append(Ipau)
+            data["capacitance"].append(C_meas)
+            data["resistance"].append(R_meas)
+            data["current"].append(I_meas)
 
-            print(f"V={V:6.1f}V  C={C_avg:8.2e}F  R={R_avg:8.2e}Ω  I={Ipau:8.2e}A")
+            print(f"V={V:6.1f} V  C={C_meas:8.2e} F  R={R_meas:8.2e} Ω  I={I_meas:8.2e} A")
 
         safe_off()
         return data
@@ -178,8 +182,6 @@ class CVMeasurement:
         except Exception:
             return False
 
-    # --------------------------------------------------------------
-    # Data Handling
     # --------------------------------------------------------------
     def save_data(self, data):
         if data is None:
@@ -202,21 +204,9 @@ class CVMeasurement:
             comments="",
         )
 
-        # Save metadata
-        meta = outdir / (fname.replace(".csv", "_meta.txt"))
-        with open(meta, "w") as f:
-            f.write(f"Date: {timestamp}\n")
-            f.write(f"Sensor: {self.sensor_name}\n")
-            f.write(f"Pad: {self.pad_number}\n")
-            f.write(f"Frequency: {self.frequency} Hz\n")
-            f.write(f"Voltage range: {self.voltage_start} to {self.voltage_end} V\n")
-            f.write(f"Steps: {self.voltage_steps}\n")
-
         print(f"\n💾 Data saved: {fpath}")
         return fpath
 
-    # --------------------------------------------------------------
-    # Plotting
     # --------------------------------------------------------------
     def plot_results(self, data, save_path=None):
         if data is None:
@@ -229,7 +219,6 @@ class CVMeasurement:
 
         fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(10, 9))
 
-        # --- Capacitance plot ---
         ax1.plot(abs(V), C * 1e12, "b.-", label="C (pF)")
         ax1.set_xlabel("|Vbias| (V)")
         ax1.set_ylabel("Capacitance (pF)", color="b")
@@ -241,7 +230,6 @@ class CVMeasurement:
             ax1_twin.plot(abs(V[mask]), 1 / C[mask] ** 2, "r.-", label="1/C²")
             ax1_twin.set_ylabel("1/C² (F⁻²)", color="r")
 
-        # --- Resistance & Current plot ---
         ax2.plot(abs(V), R, "g.-", label="R (Ω)")
         ax2_twin = ax2.twinx()
         ax2_twin.plot(abs(V), np.abs(I), "m.-", label="|I| (A)")
@@ -251,29 +239,27 @@ class CVMeasurement:
         ax2.grid(True)
 
         plt.tight_layout()
-
         if save_path:
             plotfile = Path(save_path).with_suffix(".png")
             plt.savefig(plotfile)
             print(f"📊 Plot saved: {plotfile}")
-
         plt.show()
 
     # --------------------------------------------------------------
     def cleanup(self):
         try:
-            self.pau.close()
+            self.smu.close()
             self.lcr.close()
         except Exception:
             pass
 
 
 # -----------------------------------------------------------------
-# CLI argument parsing
+# CLI
 # -----------------------------------------------------------------
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Automated C–V measurement with Keithley 6487 and LCR meter",
+        description="Automated C–V measurement (Keithley 2470 + Wayne Kerr 4300 via GPIB)",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     parser.add_argument("--iteration", "-n", type=int)
@@ -286,30 +272,9 @@ def parse_args():
     parser.add_argument("--sensorname", type=str)
     parser.add_argument("--npad", type=str)
     args = parser.parse_args()
-
-    # Interactive fallback
-    if len(sys.argv) == 1:
-        print("\nNo command-line args detected — switching to interactive mode.\n")
-        def ask(prompt, default, t):
-            v = input(f"{prompt} [{default}]: ").strip()
-            return t(v) if v else default
-
-        args.iteration = ask("Number of measurements per voltage", 1, int)
-        args.V0 = ask("Start voltage (V)", 0.0, float)
-        args.V1 = ask("End voltage (V)", -40.0, float)
-        args.npts = ask("Number of voltage points", 81, int)
-        args.freq = ask("Measurement frequency (Hz)", 1000.0, float)
-        args.return_sweep = ask("Include return sweep? (y/n)", "y", str).lower().startswith("y")
-        args.outdir = Path(ask("Output directory", str(Path.home() / "LGAD_test" / "C-V_test"), str))
-        args.sensorname = ask("Sensor name", "SENSOR", str)
-        args.npad = ask("Pad number", "1_1", str)
-
     return args
 
 
-# -----------------------------------------------------------------
-# Main function
-# -----------------------------------------------------------------
 def main():
     args = parse_args()
     start = time.time()
@@ -325,7 +290,7 @@ def main():
     cv.sensor_name = args.sensorname or "SENSOR"
     cv.pad_number = args.npad or "1_1"
 
-    print("\n=== LGAD C–V Measurement ===")
+    print("\n=== LGAD C–V Measurement (Keithley 2470 + Wayne Kerr 4300) ===")
 
     if not cv.connect_instruments():
         print("Exiting — instruments not found.")
